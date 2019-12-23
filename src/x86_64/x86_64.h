@@ -251,3 +251,4 @@ void register_interrupt(int vector, thunk t);
 void unregister_interrupt(int vector);
 void start_cpu(heap h, heap pages, int index, void (*ap_entry)());
 void * allocate_stack(heap pages, int npages);
+void load_idt();
