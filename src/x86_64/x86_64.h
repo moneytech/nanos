@@ -249,3 +249,5 @@ u64 allocate_interrupt(void);
 void deallocate_interrupt(u64 irq);
 void register_interrupt(int vector, thunk t);
 void unregister_interrupt(int vector);
+void start_cpu(heap h, heap pages, int index, void (*ap_entry)());
+void * allocate_stack(heap pages, int npages);
