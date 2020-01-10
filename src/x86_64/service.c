@@ -13,7 +13,7 @@
 #include <kvm_platform.h>
 #include <xen_platform.h>
 
-#define SMP_TEST
+//#define SMP_TEST
 
 //#define STAGE3_INIT_DEBUG
 #ifdef STAGE3_INIT_DEBUG
@@ -429,12 +429,11 @@ static void __attribute__((noinline)) init_service_new_stack()
     install_gdt64_and_tss(0);
     unmap(PAGESIZE, INITIAL_MAP_SIZE - PAGESIZE, pages);
 
-    /* XXX just a test */
+#ifdef SMP_TEST
     ipi_vector = allocate_interrupt();
     assert(ipi_vector != INVALID_PHYSICAL);
     register_interrupt(ipi_vector, closure(heap_general(kh), ipi_interrupt));
 
-#ifdef SMP_TEST
     init_debug("performing SMP test");
     idle_cpu_queue = allocate_queue(misc, 64);
     start_cpu(misc, pages, TARGET_EXCLUSIVE_BROADCAST, new_cpu);
