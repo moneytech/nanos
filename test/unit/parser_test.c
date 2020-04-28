@@ -2,8 +2,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <buffer.h>
-
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
 
@@ -16,8 +14,9 @@ if (expr) ; else { \
 } \
 } while (0)
 
-#define test_strings_equal(s1, s2) do { \
-if (strcmp(s1, s2) != 0) { \
+/* s2 must be null-terminated */
+#define test_strings_equal(s1, s2) do {        \
+if (strncmp(s1, s2, strlen(s2)) != 0) {                         \
     msg_err("\"%s\" != \"%s\" -- failed at %s:%d\n", s1, s2, __FILE__, __LINE__); \
     return false; \
 } \
@@ -473,7 +472,7 @@ PARSE_TEST(single_closing_vector_bracket_test, "]")
 
 void init (heap h)
 {
-    p = tuple_parser(h, closure(h, finish, h), closure(h, perr));
+    p = value_parser(h, closure(h, finish, h), closure(h, perr));
 }
 
 typedef boolean (*test_func)(heap h);

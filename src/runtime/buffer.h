@@ -1,4 +1,3 @@
-#pragma once
 // consider -
 //   adding a stride
 //   going back to using bit offsets
@@ -128,6 +127,11 @@ static inline void buffer_write(buffer b, const void *source, bytes length)
     buffer_produce(b, length);
 }
 
+static inline void buffer_write_cstring(buffer b, const char *x)
+{
+    return buffer_write(b, x, runtime_strlen(x));
+}
+
 static inline boolean buffer_read(buffer b, void *dest, bytes length)
 {
     if (buffer_length(b) < length) return(false);
@@ -153,6 +157,14 @@ static inline buffer clone_buffer(heap h, buffer b)
 void buffer_append(buffer b,
                    const void *body,
                    bytes length);
+
+static inline buffer buffer_cstring(heap h, const char *x)
+{
+    int len = runtime_strlen(x);
+    buffer b = allocate_buffer(h, len);
+    buffer_append(b, x, len);
+    return b;
+}
 
 // little endian variants
 #define WRITE_BE(bits)                                          \

@@ -92,12 +92,15 @@ typedef struct iovec {
 #define EMLINK          31              /* Too many links */
 #define EPIPE           32              /* Broken pipe */
 #define ERANGE          34              /* Math result not representable */
+#define ENAMETOOLONG    36              /* File name too long */
 
 #define ENOSYS          38              /* Invalid system call number */
 #define ENOTEMPTY       39              /* Directory not empty */
+#define ELOOP           40              /* Too many symbolic links */
 #define ENOPROTOOPT     42              /* Protocol not available */
 
 #define EDESTADDRREQ    89		/* Destination address required */
+#define EMSGSIZE        90		/* Message too long */
 #define EOPNOTSUPP      95		/* Operation not supported */
 #define EISCONN         106
 #define ENOTCONN        107
@@ -116,7 +119,10 @@ typedef struct iovec {
 #define O_APPEND	00002000
 #define O_NONBLOCK	00004000
 #define O_DIRECT        00040000
+#define O_NOFOLLOW      00400000
+#define O_NOATIME       01000000
 #define O_CLOEXEC       02000000
+#define O_PATH         010000000
 
 #define F_LINUX_SPECIFIC_BASE   0x400
 
@@ -232,6 +238,11 @@ struct itimerval {
     struct timeval it_value;
 };
 
+struct utimbuf {
+    time_t actime;   /* access time */
+    time_t modtime;  /* modification time */
+};
+
 // straight from linux
 #define FUTEX_WAIT		0
 #define FUTEX_WAKE		1
@@ -246,6 +257,8 @@ struct itimerval {
 #define FUTEX_WAKE_BITSET	10
 #define FUTEX_WAIT_REQUEUE_PI	11
 #define FUTEX_CMP_REQUEUE_PI	12
+
+#define FUTEX_CLOCK_REALTIME    (1 << 8)
 
 #define  FUTEX_OP_SET        0  /* uaddr2 = oparg; */
 #define  FUTEX_OP_ADD        1  /* uaddr2 += oparg; */
@@ -536,6 +549,7 @@ typedef struct {
 #define SS_ONSTACK      1
 #define SS_DISABLE      2
 
+#define MINSIGSTKSZ     2048
 
 #define UC_FP_XSTATE            0x1
 #define UC_SIGCONTEXT_SS        0x2
@@ -730,9 +744,56 @@ struct epoll_event {
 
 typedef struct aux {u64 tag; u64 val;} *aux;
 
+struct statfs {
+    long f_type;
+    long f_bsize;
+    long f_blocks;
+    long f_bfree;
+    long f_bavail;
+    long f_files;
+    long f_ffree;
+    struct {
+        int val[2];
+    } f_fsid;
+    long f_namelen;
+    long f_frsize;
+    long f_flags;
+    long f_spare[4];
+};
+
 typedef u32 uid_t;
 typedef u32 gid_t;
 
+enum {
+    IOCB_CMD_PREAD = 0,
+    IOCB_CMD_PWRITE = 1,
+};
+
+#define IOCB_FLAG_RESFD (1 << 0)
+
+struct iocb {
+    u64 aio_data;
+    u32 aio_key;
+    u32 aio_reserved1;
+    u16 aio_lio_opcode;
+    s16 aio_reqprio;
+    u32 aio_fildes;
+    u64 aio_buf;
+    u64 aio_nbytes;
+    s64 aio_offset;
+    u64 aio_reserved2;
+    u32 aio_flags;
+    u32 aio_resfd;
+};
+
+struct io_event {
+    u64 data;
+    u64 obj;
+    s64 res;
+    s64 res2;
+};
+
+typedef struct aio_ring *aio_context_t;
 
 /* set/getsockopt optnames */
 #define SO_DEBUG     1
@@ -760,3 +821,10 @@ typedef u32 gid_t;
 /* signalfd flags */
 #define SFD_NONBLOCK O_NONBLOCK
 #define SFD_CLOEXEC  O_CLOEXEC
+
+/* fallocate flags */
+#define FALLOC_FL_KEEP_SIZE         0x01
+#define FALLOC_FL_PUNCH_HOLE        0x02
+#define FALLOC_FL_COLLAPSE_RANGE    0x08
+#define FALLOC_FL_ZERO_RANGE        0x10
+#define FALLOC_FL_INSERT_RANGE      0x20

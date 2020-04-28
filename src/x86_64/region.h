@@ -1,5 +1,3 @@
-#pragma once
-
 struct region {
     u64 base;
     u64 length;
@@ -14,11 +12,11 @@ typedef struct region *region;
 
 #define REGION_PHYSICAL          1 /* available physical memory */
 #define REGION_DEVICE            2 /* e820 physical region configured for i/o */
-#define REGION_IDENTITY          3 /* for page table allocations in stage2 and stage3 */
-#define REGION_IDENTITY_RESERVED 4 /* entire identity area which must be preserved in stage3 */
-#define REGION_FILESYSTEM        5 /* offset on disk for the filesystem, see if we can get disk info from the bios */
-#define REGION_KERNIMAGE         6 /* location of kernel elf image loaded by stage2 */
-#define REGION_RECLAIM           7 /* areas to be unmapped and reclaimed in stage3 (only stage2 stack presently) */
+#define REGION_IDENTITY          10 /* for page table allocations in stage2 and stage3 */
+#define REGION_IDENTITY_RESERVED 11 /* entire identity area which must be preserved in stage3 */
+#define REGION_FILESYSTEM        12 /* offset on disk for the filesystem, see if we can get disk info from the bios */
+#define REGION_KERNIMAGE         13 /* location of kernel elf image loaded by stage2 */
+#define REGION_RECLAIM           14 /* areas to be unmapped and reclaimed in stage3 (only stage2 stack presently) */
 
 static inline region create_region(u64 base, u64 length, int type)
 {
@@ -28,6 +26,7 @@ static inline region create_region(u64 base, u64 length, int type)
     r->base = base;
     r->length = length;
     r->type = type;
+    (r-1)->type = 0;
     return r;
 }
 
@@ -43,16 +42,16 @@ static inline u64 allocate_region(heap h, bytes size)
     u64 base = 0;
     region r;
 
-    /* Select the highest physical region that's within 32-bit space. */
+    /* Select the lowest physical region that's within 32-bit space. */
     for_regions(e) {
         if ((e->type != rh->type) ||
             ((e->length & ~MASK(PAGELOG)) < len) ||
             (e->base + e->length > U64_FROM_BIT(32)))
             continue;
-        if (e->base > base) {
-            base = e->base;
-            r = e;
-        }
+
+        base = e->base;
+        r = e;
+        break;
     }
 
     if (base == 0)
@@ -85,6 +84,8 @@ static inline u64 allocate_region(heap h, bytes size)
 static inline heap region_allocator(heap h, u64 pagesize, int type)
 {
     region_heap rh = allocate(h, sizeof(struct region_heap));
+    if (rh == INVALID_ADDRESS)
+        return INVALID_ADDRESS;
     rh->h.dealloc = leak;
     rh->h.alloc = allocate_region;    
     rh->h.pagesize = pagesize;

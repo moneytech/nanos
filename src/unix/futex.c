@@ -103,22 +103,19 @@ closure_function(2, 1, sysreturn, futex_bh,
     thread t = bound(t);
     sysreturn rv;
 
-    if (current == t)
-        rv = BLOCKQ_BLOCK_REQUIRED;
-    else if (flags & BLOCKQ_ACTION_NULLIFY)
+    if (flags & BLOCKQ_ACTION_NULLIFY)
         rv = -EINTR;
     else if (flags & BLOCKQ_ACTION_TIMEDOUT)
         rv = -ETIMEDOUT;
-    else
+    else if (current == t) {
+        return BLOCKQ_BLOCK_REQUIRED;
+        thread_log(t, "%s: struct futex: %p, blocking\n", __func__, bound(f));
+    } else
         rv = 0; /* no timer expire + not us --> actual wakeup */
 
     thread_log(t, "%s: struct futex: %p, flags 0x%lx, rv %ld\n", __func__, bound(f), flags, rv);
-
-    if (rv != BLOCKQ_BLOCK_REQUIRED) {
-        thread_wakeup(t);
-        closure_finish();
-    }
-
+    thread_wakeup(t);
+    closure_finish();
     return set_syscall_return(t, rv);
 }
 
@@ -151,6 +148,8 @@ sysreturn futex(int *uaddr, int futex_op, int val,
     
     op = futex_op & 127; // chuck the private bit
     ts = get_timeout_timestamp(op, val2);
+    clock_id clkid = (futex_op & FUTEX_CLOCK_REALTIME) ? CLOCK_ID_REALTIME :
+            CLOCK_ID_MONOTONIC;
 
     switch (op) {
     case FUTEX_WAIT: {
@@ -166,7 +165,7 @@ sysreturn futex(int *uaddr, int futex_op, int val,
 
         return blockq_check_timeout(f->bq, current, 
                                     closure(f->h, futex_bh, f, current),
-                                    false, CLOCK_ID_MONOTONIC, ts, false);
+                                    false, clkid, ts, false);
     }
 
     case FUTEX_WAKE: {
@@ -257,10 +256,9 @@ sysreturn futex(int *uaddr, int futex_op, int val,
             return set_syscall_error(current, EAGAIN);
 
         set_syscall_return(current, 0);
-        // TODO: timeout should be absolute based on CLOCK_REALTIME
         return blockq_check_timeout(f->bq, current, 
                                     closure(f->h, futex_bh, f, current),
-                                    false, CLOCK_ID_MONOTONIC, ts, false);
+                                    false, clkid, ts, true);
     }
 
     case FUTEX_REQUEUE: rprintf("futex_requeue not implemented\n"); break;

@@ -1,4 +1,3 @@
-#pragma once
 #include <uniboot.h>
 #if !defined(BOOT) && !defined(STAGE3)
 #include <unix_process_runtime.h>
@@ -16,6 +15,15 @@ typedef u64 timestamp;
 #define INVALID_PHYSICAL ((u64)infinity)
 #define INVALID_ADDRESS ((void *)infinity)
 
+#define PAGELOG 12
+#define PAGESIZE U64_FROM_BIT(PAGELOG)
+#define PAGELOG_2M 21
+#define PAGESIZE_2M U64_FROM_BIT(PAGELOG_2M)
+
+#define KB 1024
+#define MB (KB*KB)
+#define GB (KB*MB)
+
 void console_write(char *s, bytes count);
 
 void print_u64(u64 s);
@@ -32,7 +40,7 @@ void print_stack_from_here();
     do {                                            \
         if (!(x)) {                                 \
             print_stack_from_here();                \
-            halt("assertion %s failed in " __FILE__ ": %s() on line %d; halt\n", #x, __func__, __LINE__); \
+            halt("assertion " #x " failed in " __FILE__ ": %s() on line %d; halt\n", __func__, __LINE__); \
         }                                           \
     } while(0)
 #endif
@@ -64,12 +72,10 @@ static inline void console(char *s)
 #define U64_FROM_BIT(x) (1ull<<(x))
 #define MASK(x) (U64_FROM_BIT(x)-1)
 
-#ifndef MIN
-#define MIN(x, y) ((x) < (y)? (x):(y))
-#endif
-#ifndef MAX
-#define MAX(x, y) ((x) > (y)? (x):(y))
-#endif
+#define __compare(x, y, op) ({ typeof(x) __x = (x); typeof(y) __y = (y); (__x op __y ? __x : __y);})
+
+#define MIN(x, y) __compare((x), (y), <)
+#define MAX(x, y) __compare((x), (y), >)
 
 #define offsetof(__t, __e) u64_from_pointer(&((__t)0)->__e)
 
@@ -83,7 +89,6 @@ static inline void zero(void *x, bytes length)
 typedef struct heap *heap;
 #include <table.h>
 #include <heap/heap.h>
-#include <kernel_heaps.h>
 
 // transient is supposed to be cleaned up when we can guarantee that
 // its out of scope - so we argue its ok to make it global. however
@@ -148,29 +153,37 @@ typedef void *value;
 
 #include <symbol.h>
 
+/* closures, used everywhere, including in data structures */
 #include <closure.h>
 #include <closure_templates.h>
-
 typedef closure_type(thunk, void);
 
+/* architectural deps for data structures */
+#include <x86_64.h>
+
+/* data structures */
 #include <list.h>
 #include <bitmap.h>
 #include <tuple.h>
 #include <status.h>
 #include <pqueue.h>
-#include <clock.h>
-#include <refcount.h>
-#include <timer.h>
 #include <range.h>
+#include <queue.h>
+#include <refcount.h>
 
-#define PAGELOG 12
-#define PAGESIZE U64_FROM_BIT(PAGELOG)
-#define PAGELOG_2M 21
-#define PAGESIZE_2M U64_FROM_BIT(PAGELOG_2M)
+/* heaps that depend on above structures */
+#include <heap/id.h>
+
+/* clocksource and timer facilities */
+#include <clock.h>
+#include <timer.h>
 
 typedef closure_type(buffer_handler, status, buffer);
 typedef closure_type(connection_handler, buffer_handler, buffer_handler);
+typedef closure_type(io_status_handler, void, status, bytes);
 typedef closure_type(block_io, void, void *, range, status_handler);
+
+#include <sg.h>
 
 // should be  (parser, parser, character)
 typedef closure_type(parser, void *, character);
@@ -178,6 +191,7 @@ typedef closure_type(parser, void *, character);
 typedef closure_type(parse_error, void, buffer);
 typedef closure_type(parse_finish, void, void *);
 parser tuple_parser(heap h, parse_finish c, parse_error err);
+parser value_parser(heap h, parse_finish c, parse_error err);
 parser parser_feed (parser p, buffer b);
 
 // RNG
@@ -189,17 +203,12 @@ typedef struct signature {
     u64 s[4];
 } *signature;
 
-void init_runtime(kernel_heaps kh);
-heap allocate_tagged_region(kernel_heaps kh, u64 tag);
+void init_runtime(heap h);
 
 extern thunk ignore;
 extern status_handler ignore_status;
 
 #include <metadata.h>
-
-#define KB 1024
-#define MB (KB*KB)
-#define GB (KB*MB)
 
 #define cstring(b, t) ({buffer_clear(t); push_buffer((t), (b)); push_u8((t), 0); (char*)(t)->contents;})
 

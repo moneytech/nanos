@@ -1,12 +1,20 @@
-#include <runtime.h>
-#include <x86_64.h>
+#include <kernel.h>
 #include <kvm_platform.h>
 #include <page.h>
 #include <region.h>
 #include <apic.h>
 
+//#define INT_DEBUG
+#ifdef INT_DEBUG
+#define int_debug(x, ...) do {log_printf("  INT", x, ##__VA_ARGS__);} while(0)
+#else
+#define int_debug(x, ...)
+#endif
+
 #define INTERRUPT_VECTOR_START 32 /* end of exceptions; defined by architecture */
-static char *interrupts[] = {
+#define MAX_INTERRUPT_VECTORS  256 /* as defined by architecture; we may have less */
+
+static const char *interrupt_names[MAX_INTERRUPT_VECTORS] = {
     "Divide by 0",
     "Reserved",
     "NMI Interrupt",
@@ -40,37 +48,32 @@ static char *interrupts[] = {
     "reserved 1e",
     "reserved 1f"};
 
-static inline char *interrupt_name(u64 s)
-{
-    return s < INTERRUPT_VECTOR_START ? interrupts[s] : "";
-}
-
 static char* textoreg[] = {
-    "  rax", //0
-    "  rbx", //1
-    "  rcx", //2
-    "  rdx", //3
-    "  rsi", //4
-    "  rdi", //5
-    "  rbp", //6
-    "  rsp", //7
-    "   r8",  //8
-    "   r9",  //9
-    "  r10", //10
-    "  r11", //11
-    "  r12", //12
-    "  r13", //13
-    "  r14", //14
-    "  r15", //15
-    "  rip", //16
-    "flags", //17
-    "   ss",  //18
-    "   cs",  //19
-    "   ds",  //20
-    "   es",  //21
-    "   fs",  //22
-    "   gs",  //23
-    "vector", // 24
+    "   rax", //0
+    "   rbx", //1
+    "   rcx", //2
+    "   rdx", //3
+    "   rsi", //4
+    "   rdi", //5
+    "   rbp", //6
+    "   rsp", //7
+    "    r8", //8
+    "    r9", //9
+    "   r10", //10
+    "   r11", //11
+    "   r12", //12
+    "   r13", //13
+    "   r14", //14
+    "   r15", //15
+    "   rip", //16
+    "rflags", //17
+    "    ss", //18
+    "    cs", //19
+    "    ds", //20
+    "    es", //21
+    "fsbase", //22
+    "gsbase", //23
+    "vector", //24
 };
 
 static inline char *register_name(u64 s)
@@ -85,7 +88,13 @@ static inline void *idt_from_interrupt(int interrupt)
     return pointer_from_u64((u64_from_pointer(idt) + 2 * sizeof(u64) * interrupt));
 }
 
-static void write_idt(int interrupt, u64 offset, u64 ist)
+/* XXX Sigh...the noinline is a workaround for an issue where a clang
+   build on macos is somehow leading to incorrect IDT entries. This
+   needs more investigation.
+
+   https://github.com/nanovms/nanos/issues/1060
+*/
+static void __attribute__((noinline)) write_idt(int interrupt, u64 offset, u64 ist)
 {
     u64 selector = 0x08;
     u64 type_attr = 0x8e;
@@ -97,7 +106,7 @@ static void write_idt(int interrupt, u64 offset, u64 ist)
 }
 
 static thunk *handlers;
-context running_frame;
+u32 spurious_int_vector;
 
 char * find_elf_sym(u64 a, u64 *offset, u64 *len);
 
@@ -164,12 +173,14 @@ void print_stack(context c)
 void print_frame(context f)
 {
     u64 v = f[FRAME_VECTOR];
-    console(interrupt_name(v));
-    console("\n");
-    console("interrupt: ");
+    console(" interrupt: ");
     print_u64(v);
-    console("\n");
-    console("frame: ");
+    if (v < INTERRUPT_VECTOR_START) {
+        console(" (");
+        console((char *)interrupt_names[v]);
+        console(")");
+    }
+    console("\n     frame: ");
     print_u64_with_sym(u64_from_pointer(f));
     console("\n");    
 
@@ -181,11 +192,12 @@ void print_frame(context f)
 
     // page fault
     if (v == 14)  {
-        console("address: ");
+        console("   address: ");
         print_u64_with_sym(f[FRAME_CR2]);
         console("\n");
     }
     
+    console("\n");
     for (int j = 0; j < 24; j++) {
         console(register_name(j));
         console(": ");
@@ -194,28 +206,13 @@ void print_frame(context f)
     }
 }
 
-context miscframe;              /* for context save on interrupt */
-context intframe;               /* for context save on exception within interrupt */
-context bhframe;
-
-void kernel_sleep()
-{
-    running_frame = miscframe;
-    enable_interrupts();
-    __asm__("hlt");
-    disable_interrupts();
-}
-
 void install_fallback_fault_handler(fault_handler h)
 {
-    assert(miscframe);
-    assert(intframe);
-    miscframe[FRAME_FAULT_HANDLER] = u64_from_pointer(h);
-    intframe[FRAME_FAULT_HANDLER] = u64_from_pointer(h);
-    bhframe[FRAME_FAULT_HANDLER] = u64_from_pointer(h);
+    // XXX nuke this once we clear out kernel page faults
+    for (int i = 0; i < MAX_CPUS; i++) {
+        cpuinfo_from_id(i)->kernel_frame[FRAME_FAULT_HANDLER] = u64_from_pointer(h);
+    }
 }
-
-void * bh_stack_top;
 
 extern u32 n_interrupt_vectors;
 extern u32 interrupt_vector_size;
@@ -224,47 +221,95 @@ extern void * interrupt_vectors;
 NOTRACE
 void common_handler()
 {
-    int i = running_frame[FRAME_VECTOR];
-    boolean in_bh = running_frame == bhframe;
-    boolean in_inthandler = running_frame == intframe;
-    boolean in_usermode = (!in_inthandler && !in_bh) &&
-        (running_frame[FRAME_SS] == 0 || running_frame[FRAME_SS] == 0x13);
+    /* XXX yes, this will be a problem on a machine check or other
+       fault while in an int handler...need to fix in interrupt_common */
+    cpuinfo ci = current_cpu();
+    context f = ci->running_frame;
+    int i = f[FRAME_VECTOR];
 
-    if (in_inthandler) {
-        console("exception during interrupt handling\n");
+    if (i >= n_interrupt_vectors) {
+        console("\nexception for invalid interrupt vector\n");
+        goto exit_fault;
     }
 
-    if ((i < n_interrupt_vectors) && handlers[i]) {
-        frame_push(intframe);   /* catch any spurious exceptions during int handling */
+    // if we were idle, we are no longer
+    atomic_clear_bit(&idle_cpu_mask, ci->id);
+
+    int_debug("[%2d] # %d (%s), state %s, frame %p, rip 0x%lx, cr2 0x%lx\n",
+              ci->id, i, interrupt_names[i], state_strings[ci->state],
+              f, f[FRAME_RIP], f[FRAME_CR2]);
+
+    /* enqueue an interrupted user thread, unless the page fault handler should take care of it */
+    // what about bh?
+    if (ci->state == cpu_user && i >= INTERRUPT_VECTOR_START) {
+        int_debug("int sched %F\n", f[FRAME_RUN]);
+        schedule_frame(f);        // racy enqueue from interrupt level? we weren't interrupting the kernel...
+    }
+
+    if (i == spurious_int_vector)
+        frame_return(f);        /* direct return, no EOI */
+
+    /* Unless there's some reason to handle a page fault in interrupt
+       mode, this should always be terminal.
+
+       This really should include kernel mode, too, but we're for the
+       time being allowing the kernel to take page faults...which
+       really isn't sustainable unless we want fine-grained locking
+       around the vmaps and page tables. Validating user buffers will
+       get rid of this requirement (and allow us to add the check for
+       cpu_kernel here too).
+    */
+    if (ci->state == cpu_interrupt) {
+        console("\nexception during interrupt handling\n");
+        goto exit_fault;
+    }
+    ci->state = cpu_interrupt;
+
+    if (f[FRAME_FULL]) {
+        console("\nframe ");
+        print_u64(u64_from_pointer(f));
+        console(" already full\n");
+        goto exit_fault;
+    }
+    f[FRAME_FULL] = true;
+
+    /* invoke handler if available, else general fault handler */
+    if (handlers[i]) {
         apply(handlers[i]);
-        lapic_eoi();
-        frame_pop();
+        if (i >= INTERRUPT_VECTOR_START)
+            lapic_eoi();
     } else {
-        fault_handler f = pointer_from_u64(running_frame[FRAME_FAULT_HANDLER]);
-
-        if (f == 0) {
-            rprintf ("no fault handler\n");
-            print_frame(running_frame);
-            print_stack(running_frame);
-            vm_exit(VM_EXIT_FAULT);
+        fault_handler fh = pointer_from_u64(f[FRAME_FAULT_HANDLER]);
+        if (fh) {
+            context retframe = apply(fh, f);
+            if (retframe)
+                frame_return(retframe);
+        } else {
+            console("\nno fault handler for frame ");
+            print_u64(u64_from_pointer(f));
+            /* make a half attempt to identify it short of asking unix */
+            /* we should just have a name here */
+            if (f == current_cpu()->kernel_frame)
+                console(" (kernel frame)");
+            console("\n");
+            goto exit_fault;
         }
-        if (i < 25) {
-            running_frame = apply(f, running_frame);
-        }
     }
-
-    /* if we crossed privilege levels, reprogram SS and CS */
-    if (in_usermode) {
-        running_frame[FRAME_SS] = 0x23;
-        running_frame[FRAME_CS] = 0x1b;
-    }
-
-    /* if the interrupt didn't occur during bottom half or int handler
-       execution, switch context to bottom half processing */
-    if (!in_bh && !in_inthandler) {
-        frame_push(bhframe);
-        switch_stack(bh_stack_top, process_bhqueue);
-    }
+    if (f == current_cpu()->kernel_frame)
+        f[FRAME_FULL] = false;      /* no longer saving frame for anything */
+    runloop();
+  exit_fault:
+    console("cpu ");
+    print_u64(ci->id);
+    console(", state ");
+    console(state_strings[ci->state]);
+    console(", vector ");
+    print_u64(i);
+    console("\n");
+    print_frame(f);
+    print_stack(f);
+    apic_ipi(TARGET_EXCLUSIVE_BROADCAST, 0, shutdown_vector);
+    vm_exit(VM_EXIT_FAULT);
 }
 
 static heap interrupt_vector_heap;
@@ -279,12 +324,13 @@ void deallocate_interrupt(u64 irq)
     deallocate_u64(interrupt_vector_heap, irq, 1);
 }
 
-void register_interrupt(int vector, thunk t)
+void register_interrupt(int vector, thunk t, const char *name)
 {
     if (handlers[vector])
         halt("%s: handler for vector %d already registered (%p)\n",
              __func__, vector, handlers[vector]);
     handlers[vector] = t;
+    interrupt_names[vector] = name;
 }
 
 void unregister_interrupt(int vector)
@@ -292,79 +338,64 @@ void unregister_interrupt(int vector)
     if (!handlers[vector])
         halt("%s: no handler registered for vector %d\n", __func__, vector);
     handlers[vector] = 0;
+    interrupt_names[vector] = 0;
 }
 
-#define FAULT_STACK_PAGES       8
-#define SYSCALL_STACK_PAGES     8
+#define TSS_SIZE                0x68
 
 extern volatile void * TSS;
-static inline void write_tss_u64(int offset, u64 val)
+static inline void write_tss_u64(int cpu, int offset, u64 val)
 {
-    u64 * vec = (u64 *)(u64_from_pointer(&TSS) + offset);
+    u64 * vec = (u64 *)(u64_from_pointer(&TSS) + (TSS_SIZE * cpu) + offset);
     *vec = val;
 }
 
-static void set_ist(int i, u64 sp)
+void set_ist(int cpu, int i, u64 sp)
 {
     assert(i > 0 && i <= 7);
-    write_tss_u64(0x24 + (i - 1) * 8, sp);
+    write_tss_u64(cpu, 0x24 + (i - 1) * 8, sp);
+}
+
+void deallocate_frame(context f)
+{
+    deallocate((heap)pointer_from_u64(f[FRAME_HEAP]), f, total_frame_size());
 }
 
 context allocate_frame(heap h)
 {
-    context f = allocate_zero(h, FRAME_MAX * sizeof(u64));
+    context f = allocate_zero(h, total_frame_size());
     assert(f != INVALID_ADDRESS);
+    assert((u64_from_pointer(f) & 63) == 0);
+    xsave(f);
+    f[FRAME_HEAP] = u64_from_pointer(h);
     return f;
 }
 
 void * allocate_stack(heap pages, int npages)
 {
     void * base = allocate_zero(pages, pages->pagesize * npages);
-    if (base == INVALID_ADDRESS)
-        return base;
+    assert(base != INVALID_ADDRESS);
     return base + pages->pagesize * npages - STACK_ALIGNMENT;
 }
 
-void * syscall_stack_top;
-
-#define IST_INTERRUPT 1         /* for all interrupts */
-#define IST_PAGEFAULT 2         /* page fault specific */
-
-void start_interrupts(kernel_heaps kh)
+void init_interrupts(kernel_heaps kh)
 {
     heap general = heap_general(kh);
     heap pages = heap_pages(kh);
+    cpuinfo ci = current_cpu();
 
     /* Exception handlers */
     handlers = allocate_zero(general, n_interrupt_vectors * sizeof(thunk));
     assert(handlers != INVALID_ADDRESS);
-
-    /* Alternate frame storage */
-    miscframe = allocate_frame(general);
-    intframe = allocate_frame(general);
-    bhframe = allocate_frame(general);
+    interrupt_vector_heap = (heap)create_id_heap(general, general, INTERRUPT_VECTOR_START,
+                                                 n_interrupt_vectors - INTERRUPT_VECTOR_START, 1);
+    assert(interrupt_vector_heap != INVALID_ADDRESS);
 
     /* Page fault alternate stack */
-    void * fault_stack_top = allocate_stack(pages, FAULT_STACK_PAGES);
-    assert(fault_stack_top != INVALID_ADDRESS);
-    set_ist(IST_PAGEFAULT, u64_from_pointer(fault_stack_top));
+    set_ist(0, IST_PAGEFAULT, u64_from_pointer(ci->fault_stack));
 
     /* Interrupt handlers run on their own stack. */
-    void * int_stack_top = allocate_stack(pages, INT_STACK_PAGES);
-    assert(int_stack_top != INVALID_ADDRESS);
-    set_ist(IST_INTERRUPT, u64_from_pointer(int_stack_top));
-
-    /* Syscall stack */
-    syscall_stack_top = allocate_stack(pages, SYSCALL_STACK_PAGES);
-    assert(syscall_stack_top != INVALID_ADDRESS);
-
-    /* Bottom half stack */
-    bh_stack_top = allocate_stack(pages, BH_STACK_PAGES);
-    assert(bh_stack_top != INVALID_ADDRESS);
-
-    interrupt_vector_heap = create_id_heap(general, INTERRUPT_VECTOR_START,
-                                           n_interrupt_vectors - INTERRUPT_VECTOR_START, 1);
-    assert(interrupt_vector_heap != INVALID_ADDRESS);
+    set_ist(0, IST_INTERRUPT, u64_from_pointer(ci->int_stack));
 
     /* IDT setup */
     idt = allocate(pages, pages->pagesize);
@@ -379,8 +410,22 @@ void start_interrupts(kernel_heaps kh)
     void *idt_desc = idt_from_interrupt(n_interrupt_vectors); /* placed after last entry */
     *(u16*)idt_desc = 2 * sizeof(u64) * n_interrupt_vectors - 1;
     *(u64*)(idt_desc + sizeof(u16)) = u64_from_pointer(idt);
-    asm("lidt %0": : "m"(*(u64*)idt_desc));
+    asm volatile("lidt %0": : "m"(*(u64*)idt_desc));
+
+    u64 v = allocate_interrupt();
+    assert(v != INVALID_PHYSICAL);
+    spurious_int_vector = v;
 
     /* APIC initialization */
     init_apic(kh);
+}
+
+void triple_fault(void)
+{
+    disable_interrupts();
+    /* zero table limit to induce triple fault */
+    void *idt_desc = idt_from_interrupt(n_interrupt_vectors);
+    *(u16*)idt_desc = 0;
+    asm volatile("lidt %0; int3": : "m"(*(u64*)idt_desc));
+    while (1);
 }

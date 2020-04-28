@@ -1,6 +1,5 @@
-#include <runtime/runtime.h>
+#include <kernel.h>
 #include <x86_64/io.h>
-#include <x86_64/x86_64.h>
 #include "ata.h"
 
 /*
@@ -69,6 +68,8 @@
 #define ATA_IDENT_COMMAND_SETS 164
 #define ATA_IDENT_MAX_LBA_EXT  200
 
+#define ATA_CS_LBA48 0x4000000
+
 struct ata {
     u32 reg_port[ATA_MAX_RES];  // ATA register port
     int unit;                   // 0 - master
@@ -121,7 +122,13 @@ static int ata_wait(struct ata *dev, u8 mask)
 
         /* if drive fails status, reselect the drive and try again */
         if (status == 0xff) {
-            ata_out8(dev, ATA_DRIVE, ATA_D_IBM | ATA_DEV(dev->unit));
+            u8 sel = ATA_D_IBM | ATA_D_LBA | ATA_DEV(dev->unit);
+            ata_out8(dev, ATA_DRIVE, sel);
+            if (ata_in8(dev, ATA_DRIVE) != sel) {
+                /* drive missing */
+                return -1;
+            }
+
             timeout += 1000;
             kernel_delay(microseconds(1000));
             continue;
@@ -169,9 +176,11 @@ static int ata_io_loop(struct ata *dev, int cmd, void *buf, u64 nsectors)
         }
 
         switch (cmd) {
+        case ATA_READ:
         case ATA_READ48:
             ata_ins32(dev, ATA_DATA, buf, ATA_SECTOR_SIZE / sizeof(u32));
             break;
+        case ATA_WRITE:
         case ATA_WRITE48:
             ata_outs32(dev, ATA_DATA, buf, ATA_SECTOR_SIZE / sizeof(u32));
             break;
@@ -195,9 +204,17 @@ void ata_io_cmd(void * _dev, int cmd, void * buf, range blocks, status_handler s
         apply(s, timm("result", "%s", err));
         return;
     }
-    assert(nsectors <= 65536);
-    if (nsectors == 65536)
-        nsectors = 0;
+    if (dev->command_sets & ATA_CS_LBA48) {
+        assert(nsectors <= 65536);
+        if (nsectors == 65536)
+            nsectors = 0;
+    } else {
+        assert(nsectors <= 255);
+        if (cmd == ATA_READ48)
+            cmd = ATA_READ;
+        else if (cmd == ATA_WRITE48)
+            cmd = ATA_WRITE;
+    }
     ata_debug("%s: cmd 0x%x, blocks %R, sectors %d\n",
         __func__, cmd, blocks, nsectors);
 
@@ -206,15 +223,23 @@ void ata_io_cmd(void * _dev, int cmd, void * buf, range blocks, status_handler s
         goto timeout;
 
     // set LBA
-    ata_out8(dev, ATA_COUNT, nsectors >> 8);
-    ata_out8(dev, ATA_COUNT, nsectors);
-    ata_out8(dev, ATA_CYL_MSB, lba >> 40);
-    ata_out8(dev, ATA_CYL_LSB, lba >> 32);
-    ata_out8(dev, ATA_SECTOR, lba >> 24);
-    ata_out8(dev, ATA_CYL_MSB, lba >> 16);
-    ata_out8(dev, ATA_CYL_LSB, lba >> 8);
-    ata_out8(dev, ATA_SECTOR, lba);
-    ata_out8(dev, ATA_DRIVE, ATA_D_LBA | ATA_DEV(dev->unit));
+    if (dev->command_sets & ATA_CS_LBA48) {
+        ata_out8(dev, ATA_COUNT, nsectors >> 8);
+        ata_out8(dev, ATA_COUNT, nsectors);
+        ata_out8(dev, ATA_CYL_MSB, lba >> 40);
+        ata_out8(dev, ATA_CYL_LSB, lba >> 32);
+        ata_out8(dev, ATA_SECTOR, lba >> 24);
+        ata_out8(dev, ATA_CYL_MSB, lba >> 16);
+        ata_out8(dev, ATA_CYL_LSB, lba >> 8);
+        ata_out8(dev, ATA_SECTOR, lba);
+        ata_out8(dev, ATA_DRIVE, ATA_D_LBA | ATA_DEV(dev->unit));
+    } else {
+        ata_out8(dev, ATA_COUNT, nsectors);
+        ata_out8(dev, ATA_CYL_MSB, lba >> 16);
+        ata_out8(dev, ATA_CYL_LSB, lba >> 8);
+        ata_out8(dev, ATA_SECTOR, lba);
+        ata_out8(dev, ATA_DRIVE, ATA_D_IBM | ATA_D_LBA | ATA_DEV(dev->unit) | ((lba >> 24) & 0x0f));
+    }
 
     // send I/O command
     ata_out8(dev, ATA_COMMAND, cmd);
@@ -269,23 +294,28 @@ boolean ata_probe(struct ata *dev)
     dev->reg_port[ATA_STATUS] = dev->reg_port[ATA_COMMAND];
     dev->reg_port[ATA_ALTSTAT] = dev->reg_port[ATA_CONTROL];
 
-    // reset controller (master is selected)
+    // reset controller
     ata_out8(dev, ATA_CONTROL, ATA_A_RESET);
     kernel_delay(milliseconds(2));
     ata_out8(dev, ATA_CONTROL, 0);
     kernel_delay(nanoseconds(400));
+
+    // select primary master
+    u8 sel = ATA_D_IBM | ATA_D_LBA | ATA_DEV(dev->unit);
+    ata_out8(dev, ATA_DRIVE, sel);
+    if (ata_in8(dev, ATA_DRIVE) != sel) {
+        // drive does not exist
+        ata_debug("%s: drive does not exist\n", __func__);
+        return false;
+    }
 
     // disable interrupts
     ata_out8(dev, ATA_CONTROL, ATA_A_IDS);
 
     // identify
     ata_out8(dev, ATA_COMMAND, ATA_ATA_IDENTIFY);
-    if (ata_in8(dev, ATA_STATUS) == 0) {
-        // drive does not exist
-        return false;
-    }
     if (ata_wait(dev, ATA_S_READY | ATA_S_DRQ) < 0) {
-        rprintf("%s: IDENTIFY timeout\n", __func__);
+        ata_debug("%s: IDENTIFY timeout\n", __func__);
         return false;
     }
     char buf[512];
@@ -295,7 +325,13 @@ boolean ata_probe(struct ata *dev)
     runtime_memcpy(&dev->capabilities, buf + ATA_IDENT_CAPABILITIES, sizeof(dev->capabilities));
     runtime_memcpy(&dev->command_sets, buf + ATA_IDENT_COMMAND_SETS, sizeof(dev->command_sets));
     u64 sectors;
-    runtime_memcpy(&sectors, buf + ATA_IDENT_MAX_LBA_EXT, sizeof(sectors));
+    if (dev->command_sets & ATA_CS_LBA48) {
+        runtime_memcpy(&sectors, buf + ATA_IDENT_MAX_LBA_EXT, sizeof(sectors));
+    } else {
+        u32 lba28_sectors;
+        runtime_memcpy(&lba28_sectors, buf + 120, sizeof(lba28_sectors));
+	sectors = lba28_sectors;
+    }
     dev->capacity = sectors * ATA_SECTOR_SIZE;
     for (int i = 0; i < sizeof(dev->model) - 1; i += 2) {
         dev->model[i] = buf[ATA_IDENT_MODEL + i + 1];

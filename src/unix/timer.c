@@ -165,7 +165,7 @@ sysreturn timerfd_settime(int fd, int flags,
     boolean absolute = (flags & TFD_TIMER_ABSTIME) != 0;
     timer_debug("register timer: cid %d, init value %T, absolute %d, interval %T\n",
                 ut->cid, tinit, absolute, interval);
-    timer t = register_timer(ut->cid, tinit, absolute, interval,
+    timer t = register_timer(runloop_timers, ut->cid, tinit, absolute, interval,
                              closure(unix_timer_heap, timerfd_timer_expire, ut));
     if (t == INVALID_ADDRESS)
         return -ENOMEM;
@@ -395,7 +395,7 @@ sysreturn timer_settime(u32 timerid, int flags,
     boolean absolute = (flags & TFD_TIMER_ABSTIME) != 0;
     timer_debug("register timer: cid %d, init value %T, absolute %d, interval %T\n",
                 ut->cid, tinit, absolute, interval);
-    timer t = register_timer(ut->cid, tinit, absolute, interval,
+    timer t = register_timer(runloop_timers, ut->cid, tinit, absolute, interval,
                              closure(unix_timer_heap, posix_timer_expire, ut));
     if (t == INVALID_ADDRESS)
         return -ENOMEM;
@@ -433,7 +433,7 @@ sysreturn timer_delete(u32 timerid) {
         thread_release(ut->info.posix.recipient);
     process p = current->p;
     remove_unix_timer(ut);
-    deallocate_u64(p->posix_timer_ids, ut->info.posix.id, 1);
+    deallocate_u64((heap)p->posix_timer_ids, ut->info.posix.id, 1);
     vector_set(p->posix_timers, ut->info.posix.id, 0);
     deallocate_unix_timer(ut);
     return 0;
@@ -481,7 +481,7 @@ sysreturn timer_create(int clockid, struct sigevent *sevp, u32 *timerid)
         }
     }
 
-    u64 id = allocate_u64(p->posix_timer_ids, 1);
+    u64 id = allocate_u64((heap)p->posix_timer_ids, 1);
     if (id == INVALID_PHYSICAL)
         return -ENOMEM;
 
@@ -496,7 +496,7 @@ sysreturn timer_create(int clockid, struct sigevent *sevp, u32 *timerid)
 
     unix_timer ut = allocate_unix_timer(UNIX_TIMER_TYPE_POSIX, clockid);
     if (ut == INVALID_ADDRESS) {
-        deallocate_u64(p->posix_timer_ids, id, 1);
+        deallocate_u64((heap)p->posix_timer_ids, id, 1);
         return -ENOMEM;
     }
 
@@ -557,20 +557,42 @@ closure_function(1, 1, void, itimer_expire,
         remove_unix_timer(ut);     /* deallocs closure for us */
 }
 
+#define USEC_LIMIT 999999
+
 sysreturn setitimer(int which, const struct itimerval *new_value,
                     struct itimerval *old_value)
 {
     clock_id clockid;
     process p = current->p;
 
-    if (which == ITIMER_VIRTUAL || which == ITIMER_PROF) {
-        msg_err("timer type %d not yet supported\n");
+    /* Since we are a unikernel, and ITIMER_REAL accounts for both
+       user and system time, we'll just treat it like an ITIMER_REAL.
+
+       This isn't entirely accurate because it accounts for system
+       time that isn't on behalf of running threads. A more accurate
+       method might be to create a timer heap per clock domain (in
+       this case timer heaps attached to the process itself). We are
+       presently limited by all timers mapping to monotonic system
+       time. */
+    if (which == ITIMER_VIRTUAL) {
+        msg_err("timer type %d not yet supported\n", which);
+        if (new_value) {
+            msg_err("   (it_value %T, it_interval %T)\n",
+                    time_from_timeval(&new_value->it_value),
+                    time_from_timeval(&new_value->it_interval));
+        }
         return -EOPNOTSUPP;
-    } else if (which != ITIMER_REAL) {
-        return -EINVAL;
-    } else {
+    } else if (which == ITIMER_REAL) {
         clockid = CLOCK_ID_REALTIME;
+    } else if (which == ITIMER_PROF) {
+        clockid = CLOCK_ID_MONOTONIC;
+    } else {
+        return -EINVAL;
     }
+
+    if (new_value && (new_value->it_value.tv_usec > USEC_LIMIT ||
+                      new_value->it_interval.tv_usec > USEC_LIMIT))
+        return -EINVAL;
 
     unix_timer ut = vector_get(p->itimers, which);
     if (!ut) {
@@ -608,7 +630,7 @@ sysreturn setitimer(int which, const struct itimerval *new_value,
 
     timer_debug("register timer: clockid %d, init value %T, interval %T\n",
                 clockid, tinit, interval);
-    timer t = register_timer(clockid, tinit, false, interval,
+    timer t = register_timer(runloop_timers, clockid, tinit, false, interval,
                              closure(unix_timer_heap, itimer_expire, ut));
     if (t == INVALID_ADDRESS)
         return -ENOMEM;

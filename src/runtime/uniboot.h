@@ -1,5 +1,3 @@
-#pragma once
-
 #include <predef.h>
 
 #ifdef BOOT
@@ -34,6 +32,12 @@ static inline u16 tagof(void* v) {
 #define KERNEL_RESERVE_START 0x7f000000
 #define KERNEL_RESERVE_END   0x80000000
 
+extern void * AP_BOOT_PAGE;
+
+/* AP boot page */
+#define AP_BOOT_START u64_from_pointer(&AP_BOOT_PAGE)
+#define AP_BOOT_END (AP_BOOT_START + PAGESIZE)
+
 /* identity-mapped space for page tables - we can shrink this if we
    ever make the page table code aware of mappings (e.g. virt_from_phys) */
 #define IDENTITY_HEAP_SIZE (128 * MB)
@@ -43,11 +47,37 @@ static inline u16 tagof(void* v) {
    recycled in stage3, so be generous */
 #define STAGE2_WORKING_HEAP_SIZE (128 * MB)
 
+#define STAGE2_STACK_PAGES  32  /* stage2 stack is recycled, too */
+#define KERNEL_STACK_PAGES  32
+#define FAULT_STACK_PAGES   8
+#define INT_STACK_PAGES     8
+#define BH_STACK_PAGES      8
+#define SYSCALL_STACK_PAGES 8
+
 /* maximum buckets that can fit within a PAGESIZE_2M mcache */
 #define TABLE_MAX_BUCKETS 131072
 
 /* runloop timer minimum and maximum */
 #define RUNLOOP_TIMER_MAX_PERIOD_US     100000
-#define RUNLOOP_TIMER_MIN_PERIOD_US     10
+#define RUNLOOP_TIMER_MIN_PERIOD_US     1000
+
+/* XXX just for initial mp bringup... */
+#define MAX_CPUS 16
+
+/* could probably find progammatically via cpuid... */
+#define DEFAULT_CACHELINE_SIZE 64
+
+/* TFS stuff */
+#define TFS_LOG_DEFAULT_EXTENSION_SIZE (512*KB)
+
+/* Xen stuff */
+#define XENNET_INIT_RX_BUFFERS_FACTOR 4
+#define XENNET_RX_SERVICEQUEUE_DEPTH 512
+#define XENNET_TX_SERVICEQUEUE_DEPTH 512
+
+/* mm stuff */
+#define CACHE_DRAIN_CUTOFF (64 * MB)
 
 #include <x86.h>
+void xsave(void *);
+

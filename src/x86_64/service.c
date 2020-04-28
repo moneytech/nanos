@@ -1,36 +1,43 @@
-#include <runtime.h>
+/* TODO: this file has become a garbage dump ... reorganize */
+
+#include <kernel.h>
 #include <pci.h>
 #include <tfs.h>
-#include <x86_64.h>
+#include <pagecache.h>
+#include <apic.h>
 #include <region.h>
 #include <page.h>
 #include <symtab.h>
 #include <virtio/virtio.h>
 #include <drivers/storage.h>
 #include <drivers/console.h>
-#include <unix_internal.h>
 #include <kvm_platform.h>
 #include <xen_platform.h>
 
+//#define SMP_ENABLE
+//#define SMP_DUMP_FRAME_RETURN_COUNT
+
 //#define STAGE3_INIT_DEBUG
+//#define MM_DEBUG
+
 #ifdef STAGE3_INIT_DEBUG
-#define init_debug(x) do {console("INIT: " x "\n");} while(0)
+#define init_debug(x, ...) do {rprintf("INIT: " x "\n", ##__VA_ARGS__);} while(0)
 #else
-#define init_debug(x)
+#define init_debug(x, ...)
 #endif
 
 extern void init_net(kernel_heaps kh);
-extern void start_interrupts(kernel_heaps kh);
+extern void init_interrupts(kernel_heaps kh);
 
 static struct kernel_heaps heaps;
 
-heap allocate_tagged_region(kernel_heaps kh, u64 tag)
+static heap allocate_tagged_region(kernel_heaps kh, u64 tag)
 {
     heap h = heap_general(kh);
-    heap p = heap_physical(kh);
+    heap p = (heap)heap_physical(kh);
     u64 tag_base = tag << va_tag_offset;
     u64 tag_length = U64_FROM_BIT(va_tag_offset);
-    heap v = create_id_heap(h, tag_base, tag_length, p->pagesize);
+    heap v = (heap)create_id_heap(h, heap_backed(kh), tag_base, tag_length, p->pagesize);
     assert(v != INVALID_ADDRESS);
     heap backed = physically_backed(h, v, p, heap_pages(kh), p->pagesize);
     if (backed == INVALID_ADDRESS)
@@ -58,75 +65,8 @@ static u64 bootstrap_alloc(heap h, bytes length)
     return result;
 }
 
-queue runqueue;                 /* dispatched in runloop */
-queue bhqueue;                  /* dispatched to exhaustion in process_bhqueue */
-queue deferqueue;               /* same as bhqueue, but only for previously queued items */
-
-static timestamp runloop_timer_min;
-static timestamp runloop_timer_max;
-
-static void timer_update(void)
-{
-    /* find timer interval from timer heap, bound by configurable min and max */
-    timestamp timeout = MAX(MIN(timer_check(), runloop_timer_max), runloop_timer_min);
-    runloop_timer(timeout);
-}
-
-extern void interrupt_exit(void);
-
-/* could make a generic hook/register if more users... */
-thunk unix_interrupt_checks;
-
-NOTRACE
-void process_bhqueue()
-{
-    /* XXX - we're on bh frame & stack; re-enable ints here */
-    thunk t;
-    int defer_waiters = queue_length(deferqueue);
-    while ((t = dequeue(bhqueue))) {
-        apply(t);
-    }
-
-    /* only process deferred items that were queued prior to call -
-       this allows bhqueue and deferqueue waiters to re-schedule for
-       subsequent bh processing */
-    while (defer_waiters > 0 && (t = dequeue(deferqueue))) {
-        apply(t);
-        defer_waiters--;
-    }
-
-    timer_update();
-
-    /* XXX - and disable before frame pop */
-    frame_pop();
-
-    if (unix_interrupt_checks)
-        apply(unix_interrupt_checks);
-    interrupt_exit();
-}
-
-void runloop()
-{
-    thunk t;
-
-    while(1) {
-        while((t = dequeue(runqueue))) {
-            apply(t);
-            disable_interrupts();
-        }
-        if (current) {
-            proc_pause(current->p);
-        }
-        timer_update();
-        kernel_sleep();
-        if (current) {
-            proc_resume(current->p);
-        }
-    }
-}
-
 //#define MAX_BLOCK_IO_SIZE PAGE_SIZE
-#define MAX_BLOCK_IO_SIZE (256 * 1024)
+#define MAX_BLOCK_IO_SIZE (64 * 1024)
 
 closure_function(2, 3, void, offset_block_io,
                  u64, offset, block_io, io,
@@ -160,9 +100,38 @@ closure_function(1, 2, void, fsstarted,
                  tuple, root,
                  filesystem, fs, status, s)
 {
-    assert(s == STATUS_OK);
+    if (!is_ok(s))
+        halt("unable to open filesystem: %v\n", s);
+
     enqueue(runqueue, create_init(&heaps, bound(root), fs));
     closure_finish();
+}
+
+/* will become list I guess */
+static pagecache global_pagecache;
+
+/* This is very simplistic and uses a fixed drain threshold. This
+   should also take all cached data in system into account. For now we
+   just pick on the single pagecache... */
+
+#ifdef MM_DEBUG
+#define mm_debug(x, ...) do {rprintf("MM:   " x, ##__VA_ARGS__);} while(0)
+#else
+#define mm_debug(x, ...) do { } while(0)
+#endif
+void mm_service(void)
+{
+    if (!global_pagecache)
+        return;
+    heap p = (heap)heap_physical(&heaps);
+    u64 free = heap_total(p) - heap_allocated(p);
+    mm_debug("%s: total %ld, alloc %ld, free %ld\n", __func__, heap_total(p), heap_allocated(p), free);
+    if (free < CACHE_DRAIN_CUTOFF) {
+        u64 drain_bytes = CACHE_DRAIN_CUTOFF - free;
+        u64 drained = pagecache_drain(global_pagecache, drain_bytes);
+        if (drained > 0)
+            mm_debug("   drained %ld / %ld requested...\n", drained, drain_bytes);
+    }
 }
 
 closure_function(2, 3, void, attach_storage,
@@ -171,13 +140,26 @@ closure_function(2, 3, void, attach_storage,
 {
     // with filesystem...should be hidden as functional handlers on the tuplespace
     heap h = heap_general(&heaps);
+    u64 offset = bound(fs_offset);
+    length -= offset;
+    pagecache pc = allocate_pagecache(h, heap_backed(&heaps), length, PAGESIZE_2M, SECTOR_SIZE,
+                                      0 /* XXX mapper */,
+                                      closure(h, offset_block_io, bound(fs_offset), r),
+                                      closure(h, offset_block_io, bound(fs_offset), w));
+    if (pc == INVALID_ADDRESS)
+        halt("unable to create pagecache\n");
+
+    /* figure that later pagecaches will register themselves with backing - glue for now */
+    global_pagecache = pc;
     create_filesystem(h,
+                      SECTOR_SIZE,
                       SECTOR_SIZE,
                       length,
                       heap_backed(&heaps),
-                      closure(h, offset_block_io, bound(fs_offset), r),
-                      closure(h, offset_block_io, bound(fs_offset), w),
+                      pagecache_reader_sg(pc),
+                      pagecache_writer(pc),
                       bound(root),
+                      false,
                       closure(h, fsstarted, bound(root)));
     closure_finish();
 }
@@ -193,7 +175,7 @@ static void read_kernel_syms()
 	    kern_base = e->base;
 	    kern_length = e->length;
 
-	    u64 v = allocate_u64(heap_virtual_huge(&heaps), kern_length);
+	    u64 v = allocate_u64((heap)heap_virtual_huge(&heaps), kern_length);
 	    map(v, kern_base, kern_length, 0, heap_pages(&heaps));
 #ifdef ELF_SYMTAB_DEBUG
 	    rprintf("kernel ELF image at 0x%lx, length %ld, mapped at 0x%lx\n",
@@ -209,8 +191,6 @@ static void read_kernel_syms()
 	console("kernel elf image region not found; no debugging symbols\n");
     }
 }
-
-extern void install_gdt64_and_tss();
 
 static boolean have_rdseed = false;
 static boolean have_rdrand = false;
@@ -264,11 +244,79 @@ static void reclaim_regions(void)
     }
 }
 
-static void init_runloop_timer(void)
+static tuple root;
+
+void vm_exit(u8 code)
 {
-    runloop_timer_min = microseconds(RUNLOOP_TIMER_MIN_PERIOD_US);
-    runloop_timer_max = microseconds(RUNLOOP_TIMER_MAX_PERIOD_US);
+#ifdef SMP_DUMP_FRAME_RETURN_COUNT
+    rprintf("cpu\tframe returns\n");
+    for (int i = 0; i < MAX_CPUS; i++) {
+        cpuinfo ci = cpuinfo_from_id(i);
+        if (ci->frcount)
+            rprintf("%d\t%ld\n", i, ci->frcount);
+    }
+#endif
+
+    /* TODO MP: coordinate via IPIs */
+    if (root && table_find(root, sym(reboot_on_exit))) {
+        triple_fault();
+    } else {
+        QEMU_HALT(code);
+    }
 }
+
+struct cpuinfo cpuinfos[MAX_CPUS];
+
+static void init_cpuinfos(kernel_heaps kh)
+{
+    heap h = heap_general(kh);
+    heap pages = heap_pages(kh);
+
+    /* We're stuck with a hard limit of 64 for now due to bitmask... */
+    build_assert(MAX_CPUS <= 64);
+
+    /* We'd like the aps to allocate for themselves, but we don't have
+       per-cpu heaps just yet. */
+    for (int i = 0; i < MAX_CPUS; i++) {
+        cpuinfo ci = cpuinfo_from_id(i);
+        ci->self = ci;
+
+        /* state */
+        ci->running_frame = 0;
+        ci->id = i;
+        ci->state = cpu_not_present;
+        ci->have_kernel_lock = false;
+        ci->frcount = 0;
+        /* frame and stacks */
+        ci->kernel_frame = allocate_frame(h);
+        ci->kernel_stack = allocate_stack(pages, KERNEL_STACK_PAGES);
+        ci->fault_stack = allocate_stack(pages, FAULT_STACK_PAGES);
+        ci->int_stack = allocate_stack(pages, INT_STACK_PAGES);
+        //        init_debug("cpu %2d: kernel_frame %p, kernel_stack %p", i, ci->kernel_frame, ci->kernel_stack);
+        //        init_debug("        fault_stack  %p, int_stack    %p", ci->fault_stack, ci->int_stack);
+    }
+
+    cpu_setgs(0);
+}
+
+u64 total_processors = 1;
+
+#ifdef SMP_ENABLE
+static void new_cpu()
+{
+    fetch_and_add(&total_processors, 1);
+    if (platform_timer_percpu_init)
+        apply(platform_timer_percpu_init);
+
+    /* For some reason, we get a spurious wakeup from hlt on linux/kvm
+       after AP start. Spin here to cover it (before moving on to runloop). */
+    while (1)
+        kernel_sleep();
+}
+#endif
+
+u64 xsave_features();
+u64 xsave_frame_size();
 
 static void __attribute__((noinline)) init_service_new_stack()
 {
@@ -278,31 +326,41 @@ static void __attribute__((noinline)) init_service_new_stack()
 
     /* runtime and console init */
     init_debug("in init_service_new_stack");
+    init_debug("runtime");    
+    init_runtime(misc);
+    init_tuples(allocate_tagged_region(kh, tag_tuple));
+    init_symbols(allocate_tagged_region(kh, tag_symbol), misc);
+    init_sg(misc);
     unmap(0, PAGESIZE, pages);  /* unmap zero page */
     reclaim_regions();          /* unmap and reclaim stage2 stack */
-    init_debug("runtime");
-    init_runtime(kh);
     init_extra_prints();
+#if 0 // XXX
+    if (xsave_frame_size() == 0){
+        halt("xsave not supported\n");
+    }
+#endif
     init_pci(kh);
     init_console(kh);
     init_symtab(kh);
     read_kernel_syms();
     init_debug("pci_discover (for VGA)");
     pci_discover(); // early PCI discover to configure VGA console
-
-    /* scheduling queues init */
-    runqueue = allocate_queue(misc, 64);
-    /* XXX bhqueue is large to accomodate vq completions; explore batch processing on vq side */
-    bhqueue = allocate_queue(misc, 2048);
-    deferqueue = allocate_queue(misc, 64);
-    unix_interrupt_checks = 0;
+    init_debug("init_cpuinfos");
+    init_cpuinfos(kh);
+    current_cpu()->state = cpu_kernel;
 
     /* interrupts */
-    init_debug("start_interrupts");
-    start_interrupts(kh);
+    init_debug("init_interrupts");
+    init_interrupts(kh);
+    // xxx - we depend on interrupts being initialized in order to allocate the
+    // ipi..i guess this is safe because they are disabled?
+    init_debug("init_scheduler");    
+    init_scheduler(misc);
+    init_clock();               /* must precede platform init */
 
     /* platform detection and early init */
     init_debug("probing for KVM");
+
     if (!kvm_detect(kh)) {
         init_debug("probing for Xen hypervisor");
         if (!xen_detect(kh)) {
@@ -312,18 +370,12 @@ static void __attribute__((noinline)) init_service_new_stack()
             }
         } else {
             init_debug("xen hypervisor detected");
-            /* XXX temporary: We're falling back to HPET until we get PV timer working correctly. */
-            if (!init_hpet(kh)) {
-                halt("HPET initialization failed; no timer source\n");
-            }
         }
     } else {
         init_debug("KVM detected");
     }
 
-    /* clock, timer, RNG, stack canaries */
-    init_clock();
-    init_runloop_timer();
+    /* RNG, stack canaries */
     init_debug("RNG");
     init_hwrand();
     init_random();
@@ -334,7 +386,7 @@ static void __attribute__((noinline)) init_service_new_stack()
     init_net(kh);
 
     init_debug("probe fs, register storage drivers");
-    tuple root = allocate_tuple();
+    root = allocate_tuple();
     u64 fs_offset = 0;
     for_regions(e) {
         if (e->type == REGION_FILESYSTEM)
@@ -362,9 +414,15 @@ static void __attribute__((noinline)) init_service_new_stack()
 
     /* Switch to stage3 GDT64, enable TSS and free up initial map */
     init_debug("install GDT64 and TSS");
-    install_gdt64_and_tss();
+    install_gdt64_and_tss(0);
     unmap(PAGESIZE, INITIAL_MAP_SIZE - PAGESIZE, pages);
 
+#ifdef SMP_ENABLE
+    init_debug("starting APs");
+    start_cpu(misc, pages, TARGET_EXCLUSIVE_BROADCAST, new_cpu);
+    kernel_delay(milliseconds(200));   /* temp, til we check tables to know what we have */
+    init_debug("total CPUs %d\n", total_processors);
+#endif
     init_debug("starting runloop");
     runloop();
 }
@@ -372,7 +430,7 @@ static void __attribute__((noinline)) init_service_new_stack()
 static heap init_pages_id_heap(heap h)
 {
     boolean found = false;
-    heap pages = allocate_id_heap(h, PAGESIZE);
+    id_heap pages = allocate_id_heap(h, h, PAGESIZE);
     for_regions(e) {
 	if (e->type == REGION_IDENTITY) {
             assert(!found);     /* should only be one... */
@@ -406,12 +464,12 @@ static heap init_pages_id_heap(heap h)
         halt("no identity region found; halt\n");
     if (heaps.identity_reserved_start == 0)
         halt("reserved identity region not found; halt\n");
-    return pages;
+    return (heap)pages;
 }
 
-static heap init_physical_id_heap(heap h)
+static id_heap init_physical_id_heap(heap h)
 {
-    heap physical = allocate_id_heap(h, PAGESIZE);
+    id_heap physical = allocate_id_heap(h, h, PAGESIZE);
     boolean found = false;
     init_debug("physical memory:");
     for_regions(e) {
@@ -450,16 +508,23 @@ static void init_kernel_heaps()
     bootstrap.dealloc = leak;
 
     heaps.pages = init_pages_id_heap(&bootstrap);
-    heaps.physical = init_physical_id_heap(&bootstrap);
 
-    heaps.virtual_huge = create_id_heap(&bootstrap, HUGE_PAGESIZE,
+    /* This returns a wrapped physical heap which takes an (irq-safe)
+       lock for each heap method. Not clear if this would be better as
+       some other (non-heap) interface.
+
+       XXX should we pass pages and forget needing it as a parameter?
+       why would it ever need to be a parameter as opposed to global? */
+    heaps.physical = init_page_tables(&bootstrap, init_physical_id_heap(&bootstrap));
+
+    heaps.virtual_huge = create_id_heap(&bootstrap, &bootstrap, HUGE_PAGESIZE,
 				      (1ull<<VIRTUAL_ADDRESS_BITS)- HUGE_PAGESIZE, HUGE_PAGESIZE);
     assert(heaps.virtual_huge != INVALID_ADDRESS);
 
-    heaps.virtual_page = create_id_heap_backed(&bootstrap, heaps.virtual_huge, PAGESIZE);
+    heaps.virtual_page = create_id_heap_backed(&bootstrap, &bootstrap, (heap)heaps.virtual_huge, PAGESIZE);
     assert(heaps.virtual_page != INVALID_ADDRESS);
 
-    heaps.backed = physically_backed(&bootstrap, heaps.virtual_page, heaps.physical, heaps.pages, PAGESIZE);
+    heaps.backed = physically_backed(&bootstrap, (heap)heaps.virtual_page, (heap)heaps.physical, heaps.pages, PAGESIZE);
     assert(heaps.backed != INVALID_ADDRESS);
 
     heaps.general = allocate_mcache(&bootstrap, heaps.backed, 5, 20, PAGESIZE_2M);
@@ -475,6 +540,5 @@ void init_service()
     u64 stack_location = allocate_u64(heap_backed(&heaps), stack_size);
     stack_location += stack_size - STACK_ALIGNMENT;
     *(u64 *)stack_location = 0;
-    asm ("mov %0, %%rsp": :"m"(stack_location));
-    init_service_new_stack();
+    switch_stack(stack_location, init_service_new_stack);
 }

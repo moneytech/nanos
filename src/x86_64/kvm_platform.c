@@ -1,5 +1,4 @@
-#include <runtime.h>
-#include <x86_64.h>
+#include <kernel.h>
 #include <page.h>
 #include <pvclock.h>
 #include <kvm_platform.h>
@@ -19,11 +18,6 @@
 #define KVM_CPUID_FEATURES  0x40000001
 #define KVM_MSR_SYSTEM_TIME 0x4b564d01
 #define KVM_MSR_WALL_CLOCK  0x4b564d00
-
-void vm_exit(u8 code)
-{
-    QEMU_HALT(code);
-}
 
 void halt(char *format, ...)
 {
@@ -85,14 +79,15 @@ boolean kvm_detect(kernel_heaps kh)
     }
 
     clock_timer ct;
-    if ((ct = init_tsc_deadline_timer())) {
+    thunk per_cpu_init;
+    if (init_tsc_deadline_timer(&ct, &per_cpu_init)) {
         kvm_debug("TSC Deadline available");
-    } else if ((ct = init_lapic_timer())) {
+    } else if (init_lapic_timer(&ct, &per_cpu_init)) {
         kvm_debug("defaulting to (suboptimal) lapic timer");
     } else {
         halt("%s: no timer available\n", __func__);
     }
 
-    register_platform_clock_timer(ct);
+    register_platform_clock_timer(ct, per_cpu_init);
     return true;
 }

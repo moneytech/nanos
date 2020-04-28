@@ -1,4 +1,5 @@
 #include <unix_internal.h>
+#include <filesystem.h>
 #include <ftrace.h>
 
 typedef struct special_file {
@@ -37,6 +38,50 @@ static u32 null_events(file f)
     return EPOLLOUT;
 }
 
+closure_function(1, 1, void, maps_handler,
+                 buffer, b,
+                 vmap, map)
+{
+    buffer b = bound(b);
+
+    /* All mappings are assumed to be readable and private; offset, device and
+     * inode are unknown. */
+    bprintf(b, "%16lx-%16lx r%c%cp 00000000 00:00 0", map->node.r.start,
+            map->node.r.end, (map->flags & VMAP_FLAG_WRITABLE) ? 'w' : '-',
+            (map->flags & VMAP_FLAG_EXEC) ? 'x' : '-');
+
+    /* File path is unknown; only stack and heap pseudo-paths are known. */
+    if (map == current->p->stack_map) {
+        buffer_write_cstring(b, "\t[stack]");
+    } else if (map == current->p->heap_map) {
+        buffer_write_cstring(b, "\t[heap]");
+    }
+
+    buffer_write_cstring(b, "\n");
+}
+
+static sysreturn maps_read(file f, void *dest, u64 length, u64 offset)
+{
+    heap h = heap_general(get_kernel_heaps());
+    buffer b = allocate_buffer(h, 512);
+    if (b == INVALID_ADDRESS) {
+        return -ENOMEM;
+    }
+    vmap_iterator(current->p, stack_closure(maps_handler, b));
+    if (offset >= buffer_length(b)) {
+        return 0;
+    }
+    length = MIN(length, buffer_length(b) - offset);
+    runtime_memcpy(dest, buffer_ref(b, offset), length);
+    deallocate_buffer(b);
+    return length;
+}
+
+static u32 maps_events(file f)
+{
+    return EPOLLIN;
+}
+
 static sysreturn text_read(const char *text, bytes text_len, file f, void *dest, u64 length, u64 offset)
 {
     if (text_len <= offset)
@@ -70,6 +115,7 @@ static u32 cpu_online_events(file f)
 static special_file special_files[] = {
     { "/dev/urandom", .read = urandom_read, .write = 0, .events = urandom_events },
     { "/dev/null", .read = null_read, .write = null_write, .events = null_events },
+    { "/proc/self/maps", .read = maps_read, .events = maps_events, },
     { "/sys/devices/system/cpu/online", .read = cpu_online_read, .write = null_write, .events = cpu_online_events },
     FTRACE_SPECIAL_FILES
 };
@@ -88,7 +134,22 @@ void register_special_files(process p)
         filesystem_mkentry(p->fs, 0, sf->path, entry, false, true);
     }
 
-    filesystem_mkdir(p->fs, 0, "/sys/devices/system/cpu/cpu0", false);
+    filesystem_mkdirpath(p->fs, 0, "/sys/devices/system/cpu/cpu0", false);
+
+    tuple proc_self, proc_self_exe;
+    int ret = resolve_cstring(p->cwd, "/proc/self/exe", &proc_self_exe,
+            &proc_self);
+    if (ret == -ENOENT) {
+        assert(proc_self);
+        value program = table_find(p->process_root, sym(program));
+        assert(program);
+        buffer b = clone_buffer(h, program);
+        assert(b != INVALID_ADDRESS);
+        buffer_write_byte(b, '\0'); /* append string terminator character */
+        filesystem_symlink(p->fs, proc_self, "exe", buffer_ref(b, 0),
+                ignore_status);
+        deallocate_buffer(b);
+    }
 }
 
 static special_file *

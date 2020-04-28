@@ -1,8 +1,6 @@
-#include <runtime.h>
-#include <x86_64.h>
+#include <kernel.h>
 #include <drivers/storage.h>
 #include <virtio/scsi.h>
-#include <x86_64.h>
 #include <io.h>
 
 #include "virtio_internal.h"
@@ -439,41 +437,41 @@ static void virtio_scsi_attach(heap general, storage_attach a, heap page_allocat
     virtio_scsi_debug("features 0x%lx\n", s->v->features);
 
 #ifdef VIRTIO_SCSI_DEBUG
-    u32 num_queues = in32(s->v->base + VIRTIO_MSI_DEVICE_CONFIG + VIRTIO_SCSI_R_NUM_QUEUES);
+    u32 num_queues = pci_bar_read_4(&s->v->device_config, VIRTIO_SCSI_R_NUM_QUEUES);
     virtio_scsi_debug("num queues %d\n", num_queues);
 
-    u32 seg_max = in32(s->v->base + VIRTIO_MSI_DEVICE_CONFIG + VIRTIO_SCSI_R_SEG_MAX);
+    u32 seg_max = pci_bar_read_4(&s->v->device_config, VIRTIO_SCSI_R_SEG_MAX);
     virtio_scsi_debug("seg max %d\n", seg_max);
 
-    u32 max_sectors = in32(s->v->base + VIRTIO_MSI_DEVICE_CONFIG + VIRTIO_SCSI_R_MAX_SECTORS);
+    u32 max_sectors = pci_bar_read_4(&s->v->device_config, VIRTIO_SCSI_R_MAX_SECTORS);
     virtio_scsi_debug("max sectors %d\n", max_sectors);
 
-    u32 cmd_per_lun = in32(s->v->base + VIRTIO_MSI_DEVICE_CONFIG + VIRTIO_SCSI_R_CMD_PER_LUN);
+    u32 cmd_per_lun = pci_bar_read_4(&s->v->device_config, VIRTIO_SCSI_R_CMD_PER_LUN);
     virtio_scsi_debug("cmd per lun %d\n", cmd_per_lun);
 
-    u32 event_info_size = in32(s->v->base + VIRTIO_MSI_DEVICE_CONFIG + VIRTIO_SCSI_R_EVENT_INFO_SIZE);
+    u32 event_info_size = pci_bar_read_4(&s->v->device_config, VIRTIO_SCSI_R_EVENT_INFO_SIZE);
     virtio_scsi_debug("event info size %d\n", event_info_size);
 
-    u32 max_channel = in16(s->v->base + VIRTIO_MSI_DEVICE_CONFIG + VIRTIO_SCSI_R_MAX_CHANNEL);
+    u32 max_channel = pci_bar_read_2(&s->v->device_config, VIRTIO_SCSI_R_MAX_CHANNEL);
     virtio_scsi_debug("max channel %d\n", max_channel);
 #endif
 
-    s->max_target = in16(s->v->base + VIRTIO_MSI_DEVICE_CONFIG + VIRTIO_SCSI_R_MAX_TARGET);
+    s->max_target = pci_bar_read_2(&s->v->device_config, VIRTIO_SCSI_R_MAX_TARGET);
     virtio_scsi_debug("max target %d\n", s->max_target);
 
-    s->max_lun = in32(s->v->base + VIRTIO_MSI_DEVICE_CONFIG + VIRTIO_SCSI_R_MAX_LUN);
+    s->max_lun = pci_bar_read_4(&s->v->device_config, VIRTIO_SCSI_R_MAX_LUN);
     virtio_scsi_debug("max lun %d\n", s->max_lun);
 
-    status st = vtpci_alloc_virtqueue(s->v, 0, &s->command);
+    status st = vtpci_alloc_virtqueue(s->v, "virtio scsi command", 0, &s->command);
     assert(st == STATUS_OK);
-    st = vtpci_alloc_virtqueue(s->v, 1, &s->eventq);
+    st = vtpci_alloc_virtqueue(s->v, "virtio scsi event", 1, &s->eventq);
     assert(st == STATUS_OK);
-    st = vtpci_alloc_virtqueue(s->v, 2, &s->requestq);
+    st = vtpci_alloc_virtqueue(s->v, "virtio scsi request", 2, &s->requestq);
     assert(st == STATUS_OK);
 
     // On reset, the device MUST set sense_size to 96 and cdb_size to 32
-    out32(s->v->base + VIRTIO_MSI_DEVICE_CONFIG + VIRTIO_SCSI_R_SENSE_SIZE, VIRTIO_SCSI_SENSE_SIZE);
-    out32(s->v->base + VIRTIO_MSI_DEVICE_CONFIG + VIRTIO_SCSI_R_CDB_SIZE, VIRTIO_SCSI_CDB_SIZE);
+    pci_bar_write_4(&s->v->device_config, VIRTIO_SCSI_R_SENSE_SIZE, VIRTIO_SCSI_SENSE_SIZE);
+    pci_bar_write_4(&s->v->device_config, VIRTIO_SCSI_R_CDB_SIZE, VIRTIO_SCSI_CDB_SIZE);
 
     // initialization complete
     vtpci_set_status(s->v, VIRTIO_CONFIG_STATUS_DRIVER_OK);
@@ -490,7 +488,7 @@ closure_function(4, 1, boolean, virtio_scsi_probe,
                  heap, general, storage_attach, a, heap, page_allocator, heap, pages,
                  pci_dev, d)
 {
-    if (pci_get_vendor(d) != VIRTIO_PCI_VENDORID || pci_get_device(d) != VIRTIO_PCI_DEVICEID_SCSI)
+    if (!vtpci_probe(d, VIRTIO_ID_SCSI))
         return false;
 
     virtio_scsi_attach(bound(general), bound(a), bound(page_allocator), bound(pages), d);

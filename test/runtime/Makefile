@@ -1,9 +1,11 @@
 # these are built for the target platform (Linux x86_64)
 PROGRAMS= \
+	aio \
 	dup \
 	creat \
 	epoll \
 	eventfd \
+	fallocate \
 	fcntl \
 	fst \
 	ftrace \
@@ -21,8 +23,11 @@ PROGRAMS= \
 	sendfile \
 	signal \
 	socketpair \
+	symlink \
+	thread_test \
 	time \
 	udploop \
+	unixsocket \
 	unlink \
 	vsyscall \
 	web \
@@ -30,6 +35,11 @@ PROGRAMS= \
 	webs \
 	write \
 	writev
+
+SRCS-aio= \
+	$(CURDIR)/aio.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-aio=	-static
 
 SRCS-dup= \
 	$(CURDIR)/dup.c \
@@ -52,6 +62,12 @@ SRCS-eventfd= \
 
 LDFLAGS-eventfd=	-static
 LIBS-eventfd=		-lpthread
+
+SRCS-fallocate= \
+	$(CURDIR)/fallocate.c \
+	$(SRCDIR)/unix_process/ssp.c
+
+LDFLAGS-fallocate=	-static
 
 SRCS-fcntl= \
 	$(CURDIR)/fcntl.c \
@@ -105,6 +121,7 @@ SRCS-pipe= \
 	$(SRCDIR)/runtime/random.c \
 	$(SRCDIR)/runtime/range.c \
 	$(SRCDIR)/runtime/runtime_init.c \
+	$(SRCDIR)/runtime/sg.c \
 	$(SRCDIR)/runtime/string.c \
 	$(SRCDIR)/runtime/symbol.c \
 	$(SRCDIR)/runtime/table.c \
@@ -140,6 +157,7 @@ SRCS-signal= \
 	$(SRCDIR)/runtime/random.c \
 	$(SRCDIR)/runtime/range.c \
 	$(SRCDIR)/runtime/runtime_init.c \
+	$(SRCDIR)/runtime/sg.c \
 	$(SRCDIR)/runtime/string.c \
 	$(SRCDIR)/runtime/symbol.c \
 	$(SRCDIR)/runtime/table.c \
@@ -160,6 +178,17 @@ SRCS-socketpair= \
 	$(SRCDIR)/unix_process/ssp.c
 LDFLAGS-socketpair=	-static
 LIBS-socketpair=	-lpthread
+
+SRCS-symlink= \
+	$(CURDIR)/symlink.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-symlink=	-static
+
+SRCS-thread_test= \
+	$(SRCDIR)/unix_process/ssp.c\
+	$(CURDIR)/thread_test.c 
+LDFLAGS-thread_test=	-static
+LIBS-thread_test=	-lpthread
 
 SRCS-time= \
 	$(CURDIR)/time.c \
@@ -189,6 +218,7 @@ SRCS-udploop= \
 	$(SRCDIR)/runtime/random.c \
 	$(SRCDIR)/runtime/range.c \
 	$(SRCDIR)/runtime/runtime_init.c \
+	$(SRCDIR)/runtime/sg.c \
 	$(SRCDIR)/runtime/sha256.c \
 	$(SRCDIR)/runtime/signature.c \
 	$(SRCDIR)/runtime/string.c \
@@ -199,6 +229,12 @@ SRCS-udploop= \
 	$(SRCDIR)/runtime/tuple.c \
 	$(SRCDIR)/runtime/crypto/chacha.c
 LDFLAGS-udploop=	 -static
+
+SRCS-unixsocket= \
+	$(CURDIR)/unixsocket.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-unixsocket=	-static
+LIBS-unixsocket=	-lpthread
 
 SRCS-unlink= \
 	$(CURDIR)/unlink.c \
@@ -232,6 +268,7 @@ SRCS-web= \
 	$(SRCDIR)/runtime/random.c \
 	$(SRCDIR)/runtime/range.c \
 	$(SRCDIR)/runtime/runtime_init.c \
+	$(SRCDIR)/runtime/sg.c \
 	$(SRCDIR)/runtime/sha256.c \
 	$(SRCDIR)/runtime/signature.c \
 	$(SRCDIR)/runtime/string.c \

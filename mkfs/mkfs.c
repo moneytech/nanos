@@ -146,13 +146,6 @@ closure_function(2, 3, void, bwrite,
     apply(c, STATUS_OK);
 }
 
-closure_function(1, 3, void, bread,
-                 descriptor, d,
-                 void *, source, range, blocks, status_handler, completion)
-{
-    apply(completion, timm("error", "empty file"));
-}
-
 closure_function(0, 1, void, err,
                  status, s)
 {
@@ -309,10 +302,14 @@ static void usage(const char *program_name)
 {
     const char *p = strrchr(program_name, '/');
     p = p != NULL ? p + 1 : program_name;
-    printf("Usage: %s [-b boot-image] [-r target-root] image-file < manifest-file\n"
+    printf("Usage: %s [-b boot-image] [-r target-root] [-s image-size] "
+           "image-file < manifest-file\n"
            "\n"
            "-b	- specify boot image to prepend\n"
-           "-r	- specify target root\n",
+           "-r	- specify target root\n"
+           "-s	- specify minimum image file size; can be expressed in bytes, "
+           "KB (with k or K suffix), MB (with m or M suffix), and GB (with g or"
+           " G suffix)\n",
            p);
 }
 
@@ -321,8 +318,9 @@ int main(int argc, char **argv)
     int c;
     const char *bootimg_path = NULL;
     const char *target_root = NULL;
+    long long img_size = 0;
 
-    while ((c = getopt(argc, argv, "hb:r:")) != EOF) {
+    while ((c = getopt(argc, argv, "hb:r:s:")) != EOF) {
         switch (c) {
         case 'b':
             bootimg_path = optarg;
@@ -330,6 +328,37 @@ int main(int argc, char **argv)
         case 'r':
             target_root = optarg;
             break;
+        case 's': {
+            char *endptr;
+            img_size = strtoll(optarg, &endptr, 0);
+            if (img_size <= 0) {
+                printf("invalid image file size %lld\n", img_size);
+                usage(argv[0]);
+                exit(1);
+            }
+            switch (*endptr) {
+            case 'k':
+            case 'K':
+                img_size *= KB;
+                break;
+            case 'm':
+            case 'M':
+                img_size *= MB;
+                break;
+            case 'g':
+            case 'G':
+                img_size *= GB;
+                break;
+            case '\0':
+                break;
+            default:
+                printf("invalid image file size suffix '%s'\n", endptr);
+                usage(argv[0]);
+                exit(1);
+            }
+            img_size = pad(img_size, SECTOR_SIZE);
+            break;
+        }
         default:
             usage(argv[0]);
             exit(1);
@@ -340,7 +369,7 @@ int main(int argc, char **argv)
     const char *image_path = argv[0];
 
     heap h = init_process_runtime();
-    descriptor out = open(image_path, O_CREAT|O_RDWR, 0644);
+    descriptor out = open(image_path, O_CREAT|O_RDWR|O_TRUNC, 0644);
     if (out < 0) {
         halt("couldn't open output file %s: %s\n", image_path, strerror(errno));
     }
@@ -378,13 +407,26 @@ int main(int argc, char **argv)
     // fixing the size doesn't make sense in this context?
     create_filesystem(h,
                       SECTOR_SIZE,
+                      SECTOR_SIZE,
                       infinity,
                       h,
-                      closure(h, bread, out),
+                      0, /* no read -> new fs */
                       closure(h, bwrite, out, offset),
                       allocate_tuple(),
+                      true,
                       closure(h, fsc, h, out, target_root));
 
+    if (img_size > 0) {
+        off_t current_size = lseek(out, 0, SEEK_END);
+        if (current_size < 0) {
+            halt("could not get image size: %s\n", strerror(errno));
+        }
+        if (current_size < img_size) {
+            if (ftruncate(out, img_size)) {
+                halt("could not set image size: %s\n", strerror(errno));
+            }
+        }
+    }
     if (bootimg_path != NULL)
         write_mbr(out);
 

@@ -12,6 +12,11 @@ static inline void deallocate_tuple(tuple t)
     deallocate_table(t);
 }
 
+static inline void clear_tuple(tuple t)
+{
+    table_clear(t);
+}
+
 void encode_tuple(buffer dest, table dictionary, tuple t);
 
 
@@ -32,3 +37,5 @@ static inline value value_from_u64(heap h, u64 v)
     print_number((buffer)result, v, 10, 0);
     return result;
 }
+
+value null_value(void);

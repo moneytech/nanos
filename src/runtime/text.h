@@ -1,4 +1,3 @@
-#pragma once
 // would like to call this string.h, but unix programs
 // are pretty stubborn, in this case lwip
 
@@ -134,4 +133,27 @@ static inline boolean parse_int(buffer b, u32 base, u64 *result)
       } else break;
   }
   return st;
+}
+
+static inline const u8 *utf8_find(const u8 *x, character c)
+{
+    int nbytes;
+
+    while (x && *x) {
+        if (utf8_decode(x, &nbytes) == c) return x;
+        x += nbytes;
+    }
+    return false;
+}
+
+static inline const u8 *utf8_find_r(const u8 *x, character c)
+{
+    int nbytes;
+    const u8 *found = false;
+
+    while (x && *x) {
+        if (utf8_decode(x, &nbytes) == c) found = x;
+        x += nbytes;
+    }
+    return found;
 }
